@@ -42,6 +42,17 @@ typedef unsigned short WORD;
 
 /* stc8prog.c */
 
+typedef struct {
+    uint8_t     msr[5];
+    uint8_t     chip_version;
+    uint32_t    trim_frequency;
+    uint8_t     trim_calibration_id;
+    uint8_t     trim_divider;
+    uint32_t    trim_value;
+} stc_chip_params_t;
+
+extern stc_chip_params_t stc_params;
+
 /***
  * @brief detect chip
  * @param recv          - [out] chip detect data destination
@@ -66,5 +77,7 @@ extern int chip_read_verify(uint8_t *buf, uint8_t size, uint8_t *recv);
 extern int load_hex_file(char *filename);
 extern int parse_hex_line(char *theline, int bytes[], int *addr, int *num, int *code);
 
+extern int calibrate(const stc_protocol_t * stc_protocol, uint32_t trim_speed, uint32_t uart_baud);
+extern int option_set(const stc_protocol_t * stc_protocol, uint8_t *recv);
 
 #endif  /* __STC8PROG_H__ */
