@@ -44,6 +44,7 @@ static const struct option options[] = {
     {"speed",       required_argument,  0,  's'},
     {"reset",       required_argument,  0,  'r'},
     {"flash",       required_argument,  0,  'f'},
+    {"trim",        no_argument,        0,  't'},
     {"erase",       no_argument,        0,  'e'},
     {"debug",       no_argument,        0,  'e'},
     {"version",     no_argument,        0,  'v'},
@@ -56,6 +57,7 @@ static void usage(void)
     printf("  -h, --help              display this message\n");
     printf("  -p, --port <device>     set device path\n");
     printf("  -s, --speed <baud>      set download baudrate\n");
+    printf("  -t, --trim  <frequency> set chip trim frequency in Hz\n");
     printf("  -r, --reset <msec>      make reset sequence by pulling low dtr\n");
     printf("  -f, --flash <file>      flash chip with data from hex file\n");
     printf("  -e, --erase             erase the entire chip\n");
@@ -123,6 +125,7 @@ int main(int argc, char *const argv[])
 {
     unsigned long flags = 0;
     unsigned int speed = DEFAULTS_SPEED;
+    unsigned int trim_speed = 0;
     uint32_t reset_time = 0;
     char *file = NULL;
     char *port = DEFAULTS_PORT;
@@ -136,13 +139,16 @@ int main(int argc, char *const argv[])
 
     /** No buffer, disable buffering on stdout  */
     setbuf(stdout, NULL);
-    while ((arg = getopt_long(argc, argv, "p:r:s:f:edhv", options, &optidx)) != -1) {
+    while ((arg = getopt_long(argc, argv, "p:r:s:t:f:edhv", options, &optidx)) != -1) {
         switch (arg) {
             case 'p':
                 port = optarg;
                 break;
             case 's':
                 speed = atoi(optarg);
+                break;
+            case 't':
+                trim_speed = atoi(optarg);
                 break;
             case 'r':
                 reset_time = atoi(optarg);
@@ -206,7 +212,7 @@ int main(int argc, char *const argv[])
     else
     {
         printf("\e[31mfailed to detect chip\e[0m\n");
-        exit(1);        
+        exit(1);
     }
 
     /** chip model */
@@ -240,6 +246,16 @@ int main(int argc, char *const argv[])
     chip_minor_version = *(recv + 22);
     printf("F/W version: \e[32m%d.%d.%d%c\e[0m\n", 
         chip_version >> 4, chip_version & 0x0F, chip_minor_version & 0x0F, chip_stepping);
+    stc_params.chip_version = (uint8_t) *(recv + 17);
+
+    /** get msr for stc8gh chips*/
+    if (stc_protocol->id == PROTOCOL_STC8GH) {
+        stc_params.msr[0] = *(recv + 9);
+        stc_params.msr[1] = *(recv + 10);
+        stc_params.msr[2] = *(recv + 11);
+        stc_params.msr[3] = *(recv + 15);
+        stc_params.msr[4] = *(recv + 16);
+    }
 
     /** chip fosc */
     chip_fosc = (*(recv + stc_protocol->info_pos_fosc) << 24) 
@@ -256,6 +272,21 @@ int main(int argc, char *const argv[])
         printf("\e[32m%u\e[0m\n", chip_fosc);
     }
 
+    /** trim frequency */
+    if (trim_speed != 0) {
+        printf("Trimming IRC to \e[32m%u (Hz)\e[0m: ", trim_speed);
+        if ((ret = calibrate(stc_protocol, trim_speed, MINBAUD)))
+        {
+            printf("failed\n");
+            exit(1);
+        }
+        else
+        {
+            printf("\e[32msuccess\e[0m\n");
+        }
+    }
+
+    /** baudrate set */
     printf("Switching to \e[32m%d\e[0m baud, chip: ", speed);
     if ((ret = baudrate_set(stc_protocol, speed, recv)))
     {
@@ -313,6 +344,20 @@ int main(int argc, char *const argv[])
         {
             printf("\e[32mdone\e[0m\n");
         }
+
+        if( trim_speed != 0 ) {
+            /* set options */
+            printf("Set chip options: ");
+            if ((ret = option_set(stc_protocol, recv)) != 0)
+            {
+                printf("failed\n");
+            }
+            else
+            {
+                printf("\e[32mdone\e[0m\n");
+            }
+        }
     }
+
     return 0;
 }

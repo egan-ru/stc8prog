@@ -26,11 +26,25 @@
  */
 #define SILENT_DETECT
 
+/* disable printing dots due pulse sequence,
+ */
+#define SILENT_PULSE
+
 const uint8_t tx_detect[] = {0x7f};
 const uint8_t tx_prefix[] = {0x46, 0xb9, 0x6a, 0x00};
 const uint8_t tx_suffix[] = {0x16};
 const uint8_t rx_prefix[] = {0x46, 0xb9, 0x68, 0x00};
+const uint8_t tx_pulse[] = {0x66};
 uint8_t debug = 0, memory[65536];
+
+/* chip parameters */
+stc_chip_params_t stc_params = {
+    .msr = {0x00, 0x00, 0x00, 0x00, 0x00},
+    .trim_frequency = 0,
+    .trim_calibration_id = 0,
+    .trim_divider = 1,
+    .trim_value = 0
+};
 
 void set_debug(uint8_t val)
 {
@@ -73,6 +87,309 @@ int32_t chip_detect(uint8_t * restrict const recv,
     printf("timeout ");
 #endif
     return -1;
+}
+
+/***
+ * @brief pulse chip
+ * @param recv          - [out] chip pulse reply data destination
+ * @param retry_count   - [in] pulse retry count
+ * 
+ * @return              - 0 if data is received,
+ *                        error code otherwise
+ */ 
+int32_t chip_pulse(uint8_t * restrict const recv,
+                    const uint16_t retry_count)
+{
+    uint16_t count;
+    int ret;
+
+    for (count = 0; retry_count > count; ++count) 
+    {
+        serial.write(&serial, tx_pulse, sizeof(tx_detect));
+        if ((ret = chip_read(recv)) <= 0) {
+#ifndef SILENT_PULSE
+            if (count & 0x1FF == 0) printf("\n");
+            if (count & 0x0F == 0) printf(".");
+#endif
+            continue;
+        } else {
+            return 0;
+        } 
+    }
+#ifndef SILENT_PULSE
+    printf("timeout ");
+#endif
+    return -1;
+}
+
+/***
+ * @brief calibrate chip frequency for trimming
+ *
+ * As a result of this function global struct stc_params will be filled
+ *
+ * @param stc_protocol  - [in] pointer to chip protocol definition, used for checking compatibility
+ * @param trim_speed    - [in] desired trim frequency in Hz
+ * @param uart_baud     - [in] uart baud while calibrating
+ *
+ * @return              - 0 if calibration parameters established,
+ *                        error code otherwise
+ */
+int calibrate(const stc_protocol_t * stc_protocol, uint32_t trim_speed, uint32_t uart_baud)
+{
+    uint8_t request[BUF_SIZE] = {};
+    uint8_t response[BUF_SIZE] = {};
+
+    uint32_t proposal_frequencies[5] = { 0, 0, 0, 0, 0 };
+    uint8_t collection_id = 0;
+    uint8_t divider = 1;
+    uint32_t target_coeff = 0;
+
+    if (stc_protocol->id != PROTOCOL_STC8GH)
+    {
+        /* Untested/unsupported yet */
+        return -1;
+    }
+
+    /* this sequence tested on stc8g chip */
+    uint8_t calibrate_sequence1[12] = {
+            0x00, 0x05,
+            0x00, 0x00,
+            0x80, 0x00,
+            0x00, 0x80,
+            0x80, 0x80,
+            0xFF, 0x00
+    };
+
+    uint8_t request_size = sizeof(calibrate_sequence1);
+
+    /* Send calibration invitation */
+    memcpy(request, calibrate_sequence1, request_size);
+    chip_write(request, request_size);
+
+    /* send first pulse */
+    int recv_error = chip_pulse(response, CHIP_PULSE_TRYCOUNT);
+    if(recv_error != 0)
+    {
+        return recv_error;
+    }
+
+    /* parse first round */
+    for(uint8_t i=0; i<5; i++)
+    {
+        uint16_t proposal = (response[2 + 2 * i] << 8) + response[3 + 2 * i];
+        proposal_frequencies[i] = proposal * uart_baud;
+    }
+
+    /* check neighbor frequency proposals for equality */
+    for(uint8_t i=0; i<3; i++)
+    {
+        if(proposal_frequencies[i] == proposal_frequencies[i+1])
+        {
+            /* chip has sent equal proposals */
+            return -2;
+        }
+    }
+
+    /* collection id */
+    if ( trim_speed > proposal_frequencies[4] || trim_speed < proposal_frequencies[0] && 2 * trim_speed > proposal_frequencies[4])
+    {
+        collection_id = 1;
+    }
+
+    /* select divider */
+    uint32_t freq_multiplied = trim_speed * divider;
+    while (freq_multiplied < proposal_frequencies[2 * collection_id])
+    {
+        divider += 1;
+        freq_multiplied += trim_speed;
+        if (divider >= 64)
+        {
+            break;
+        }
+    }
+
+    /* calculate coeff */
+    if (divider < 64)
+    {
+	    stc_params.trim_divider = divider;
+        target_coeff = (trim_speed * divider - proposal_frequencies[2 * collection_id]) / 
+            ((proposal_frequencies[2 * collection_id + 1] - proposal_frequencies[2 * collection_id]) >> 7);
+
+        if (target_coeff >= 255)
+        {
+            target_coeff = 254;
+        }
+    }
+    else
+    {
+	    stc_params.trim_divider = 15;
+    }
+
+    if (target_coeff == 0)
+    {
+        target_coeff = 1;
+    }
+
+    /* calibration, round 2 */
+    uint8_t calibrate_sequence2[26] = {
+            0x00, 0x12,
+            '?', '?', '?', '?', '?', '?', '?', '?',
+            '?', '?', '?', '?', '?', '?', '?', '?',
+            '?', '?', '?', '?', '?', '?', '?', '?'
+    };
+
+    uint8_t collection = collection_id << 7;
+    for( uint8_t i = 0; i < 3; i++)
+    {
+        uint8_t coeff = (target_coeff + i - 1) & 0xFF;
+        calibrate_sequence2[2 + 8 * i] = coeff;
+        calibrate_sequence2[3 + 8 * i] = collection + 0;
+        calibrate_sequence2[4 + 8 * i] = coeff;
+        calibrate_sequence2[5 + 8 * i] = collection + 1;
+        calibrate_sequence2[6 + 8 * i] = coeff;
+        calibrate_sequence2[7 + 8 * i] = collection + 2;
+        calibrate_sequence2[8 + 8 * i] = coeff;
+        calibrate_sequence2[9 + 8 * i] = collection + 3;
+    }
+
+    /* send calibration invitation */
+    request_size = sizeof(calibrate_sequence2);
+
+    memcpy(request, calibrate_sequence2, request_size);
+    chip_write(request, request_size);
+
+    /* send second pulse */
+    recv_error = chip_pulse(response, CHIP_PULSE_TRYCOUNT);
+    if(recv_error != 0)
+    {
+        return recv_error;
+    }
+
+    /* frequencies buffer */
+    uint32_t calibration_frequencies[12] = { 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 };
+    for (uint8_t i=0; i < 12; i++)
+    {
+        uint16_t calibration = (response[2 + 2 * i] << 8) + response[3 + 2 * i];
+        calibration_frequencies[i] = calibration * uart_baud;
+    }
+
+    uint32_t multiplied_target_freq = stc_params.trim_divider * trim_speed;
+    uint8_t calibration_id = 0;
+    uint32_t freq_diff = 0xFFFFFFFF;
+
+    /* find calibration id with the smallest frequency difference */
+    for (uint8_t i=0; i < 12; i++)
+    {
+        uint32_t freq_tmp = multiplied_target_freq < calibration_frequencies[i]?
+            calibration_frequencies[i] - multiplied_target_freq:
+            multiplied_target_freq - calibration_frequencies[i]; 
+
+        if (freq_tmp < freq_diff)
+        {
+            calibration_id = i;
+            freq_diff = freq_tmp;
+        }
+    }
+
+    uint32_t freq_val = calibration_frequencies[calibration_id] / stc_params.trim_divider;
+
+    /* store result in struct */
+    stc_params.trim_calibration_id = calibration_id;
+    stc_params.trim_frequency = freq_val;
+    stc_params.trim_value = calibrate_sequence2[2 + 2 * calibration_id];    
+	
+    /* debug
+     * printf("Adjusted frequency: %.03f MHz (%.3f%%)", stc_params.trim_frequency / 1000000,
+     *        ((stc_params.trim_frequency - trim_speed) / trim_speed * 100) );
+     */
+
+    return 0;
+}
+
+/***
+ * @brief set chip options
+ *
+ * This function get values from stc_params global struct and send them to chip
+ *
+ * @param stc_protocol  - [in] pointer to chip protocol definition, used for checking compatibility
+ * @param recv          - [out] chip response
+ *
+ * @return              - 0 if chip returned anything,
+ *                        error code otherwise
+ */
+int option_set(const stc_protocol_t * stc_protocol, uint8_t *recv)
+{
+    uint8_t request[BUF_SIZE] = {};
+    int ret;
+
+    if (stc_protocol->id != PROTOCOL_STC8GH)
+    {
+        /* Untested/unsupported yet */
+        return -1;
+    }
+
+    uint8_t option_sequence[] = {
+            0x04, 0x00, 0x00,
+            0x5A, 0xA5 /* last two bytes for higher bootloader|chip version */
+    };
+
+    uint8_t options[] = {
+            0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF, 0x00, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+            0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF,
+            /* freq */ '?', '?', '?', '?',
+            /* value */ '?', '?',
+            /* divider */ '?',
+            0xFF,
+            /* low msr */ '?',
+            0xFF, 0xFF, 0xFF,
+            /* high msr */ '?', '?', '?', '?'
+    };
+
+    /* fill frequency */
+    options[24] = (uint8_t)((stc_params.trim_frequency >> 24) & 0xFF);
+    options[25] = (uint8_t)((stc_params.trim_frequency >> 16) & 0xFF);
+    options[26] = (uint8_t)((stc_params.trim_frequency >> 8) & 0xFF);
+    options[27] = (uint8_t)((stc_params.trim_frequency) & 0xFF);
+
+    /* fill trim value */
+    options[28] = (uint8_t)((stc_params.trim_calibration_id) & 0xFF); //calib id
+    options[29] = (uint8_t)((stc_params.trim_value) & 0xFF);
+
+    /* fill divider */
+    options[30] = (uint8_t)((stc_params.trim_divider) & 0xFF);
+
+    /* fill msr */
+    options[32] = (uint8_t)((stc_params.msr[0]) & 0xFF);
+    options[36] = (uint8_t)((stc_params.msr[1]) & 0xFF);
+    options[37] = (uint8_t)((stc_params.msr[2]) & 0xFF);
+    options[38] = (uint8_t)((stc_params.msr[3]) & 0xFF);
+    options[39] = (uint8_t)((stc_params.msr[4]) & 0xFF);
+
+    /* copy set option sequence */
+    memcpy(request, option_sequence, 5);
+
+    uint8_t pos = 3; /* short option sequence */
+    if(stc_params.chip_version >= 0x72)
+    {
+        pos += 2; /* full option sequence */
+    }
+
+    /* copy options */
+    memcpy(request + pos, options, sizeof(options));
+    chip_write(request, pos + sizeof(options));
+
+    for (int count = 0; count < 0xFF; ++count)
+    {
+        if ((ret = chip_read(recv)) <= 0)
+        {
+            continue;
+        }
+
+        return 0;
+    }
+
+    return 1;
 }
 
 int baudrate_set(const stc_protocol_t * stc_protocol, unsigned int speed, uint8_t *recv)

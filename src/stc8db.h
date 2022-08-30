@@ -28,6 +28,7 @@
 #define PROTOCOL_STC15B    0x0003
 #define PROTOCOL_STC15     0x0004
 
+#define CHIP_PULSE_TRYCOUNT    (uint16_t)(0x20)
 
 typedef struct _model_paras {
     char name[24];
