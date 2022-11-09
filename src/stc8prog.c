@@ -353,8 +353,8 @@ int option_set(const stc_protocol_t * stc_protocol, uint8_t *recv)
     options[27] = (uint8_t)((stc_params.trim_frequency) & 0xFF);
 
     /* fill trim value */
-    options[28] = (uint8_t)((stc_params.trim_calibration_id) & 0xFF); //calib id
-    options[29] = (uint8_t)((stc_params.trim_value) & 0xFF);
+    options[28] = (uint8_t)((stc_params.trim_value) & 0xFF);
+    options[29] = (uint8_t)((stc_params.trim_calibration_id) & 0xFF); //calib id
 
     /* fill divider */
     options[30] = (uint8_t)((stc_params.trim_divider) & 0xFF);
